@@ -161,7 +161,7 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
   origOptions = options;
 
   // to open directory
-  // even if this flag is not specifed,
+  // even if this flag is not specified,
   // there is a case to open a directory
   if (options & FILE_DIRECTORY_FILE) {
     // DbgPrint("FILE_DIRECTORY_FILE\n");
@@ -262,7 +262,7 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
   DbgPrint("CreateFile status = %lx\n", status);
   if (!CreateSuccesStatusCheck(status, disposition)) {
     if (EventContext->Flags & SL_OPEN_TARGET_DIRECTORY) {
-      DbgPrint("SL_OPEN_TARGET_DIRECTORY spcefied\n");
+      DbgPrint("SL_OPEN_TARGET_DIRECTORY specified\n");
     }
     eventInfo.Operation.Create.Information = FILE_DOES_NOT_EXIST;
     eventInfo.Status = status;
