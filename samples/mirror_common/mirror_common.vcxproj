@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClInclude Include="getopt.h" />
     <ClInclude Include="list.h" />
+    <ClInclude Include="mirror_proto.h" />
     <ClInclude Include="trace.h" />
     <ClInclude Include="transport.h" />
   </ItemGroup>
@@ -28,6 +29,7 @@
     <ClCompile Include="getopt.c" />
     <ClCompile Include="getopt_long.c" />
     <ClCompile Include="list.c" />
+    <ClCompile Include="mirror_proto.c" />
     <ClCompile Include="tcp_transport.c" />
     <ClCompile Include="trace.c" />
     <ClCompile Include="transport.c" />
@@ -142,6 +144,7 @@
       </PrecompiledHeaderFile>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <AdditionalIncludeDirectories>../../dokan;../../sys</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>

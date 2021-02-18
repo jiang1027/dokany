@@ -41,6 +41,8 @@
 
 //#include <sys/cdefs.h>
 
+#include <tchar.h>
+
 /*
  * GNU-like getopt_long() and 4.4BSD getsubopt()/optreset extensions
  */
@@ -68,10 +70,10 @@ int	 getopt_long_only(int, char * const *, const char *,
 	    const struct option *, int *);
 #ifndef _GETOPT_DEFINED_
 #define _GETOPT_DEFINED_
-int	 getopt(int, char * const *, const char *);
+int	 getopt(int, TCHAR* const *, const TCHAR*);
 int	 getsubopt(char **, char * const *, char **);
 
-extern   char *optarg;                  /* getopt(3) external variables */
+extern   TCHAR*optarg;                  /* getopt(3) external variables */
 extern   int opterr;
 extern   int optind;
 extern   int optopt;
