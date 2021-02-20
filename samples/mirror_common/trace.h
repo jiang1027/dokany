@@ -3,10 +3,6 @@
 
 #include <tchar.h>
 
-#ifndef bzero
-#define bzero(p, s)		do { memset((p), 0, (s)); } while (0)
-#endif 
-
 enum {
 	LOG_LEVEL_ERROR = 0,
 	LOG_LEVEL_WARNING,

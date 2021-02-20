@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <tchar.h>
 
+#ifndef bzero
+#define bzero(p, s)		do { memset((p), 0, (s)); } while (0)
+#endif 
+
+
 struct transport;
 
 #define TRANSPORT_CONNECTION_NAME_LENGTH	50

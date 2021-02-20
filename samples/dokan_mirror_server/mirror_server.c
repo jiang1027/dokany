@@ -578,6 +578,286 @@ void mirror_process_query_information(
 	}
 }
 
+void mirror_process_read(
+    struct transport_connection* conn, 
+    struct mirror_read_request* req
+)
+{
+    struct mirror_pdu* pdu;
+	WCHAR filePath[DOKAN_MAX_PATH];
+    HANDLE handle;
+	BOOL opened = FALSE;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    int ret;
+
+    pr_debug(_T("-> mirror_process_read(), offset(%i64d), length(%d)\n"), 
+        req->read_offset.QuadPart, req->read_length);
+
+    pdu = alloc_mirror_pdu(sizeof(*pdu) + req->read_length);
+    if (!pdu) {
+        pr_err(_T("allocate read_resp pdu failed\n"));
+        goto Cleanup;
+    }
+
+    pdu->type = MIRROR_PDU_STANDARD_REQUEST;
+    pdu->major_function = IRP_MJ_READ;
+    pdu->minor_function = 0;
+
+    handle = (HANDLE)req->file_info.Context;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("ReadFile : %s\n"), filePath);
+
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_info(_T("\tinvalid handle, cleanuped?\n"));
+		handle = CreateFile(filePath, GENERIC_READ, FILE_SHARE_READ, NULL,
+			OPEN_EXISTING, 0, NULL);
+		if (handle == INVALID_HANDLE_VALUE) {
+			DWORD error = GetLastError();
+			pr_err(_T("\tCreateFile error(%d)\n"), error);
+			pdu->u.read_resp.status = DokanNtStatusFromWin32(error);
+            pdu->length = sizeof(*pdu);
+            goto Cleanup;
+		}
+		opened = TRUE;
+	}
+
+	if (!SetFilePointerEx(handle, req->read_offset, NULL, FILE_BEGIN)) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tseek failed, error(%d)\n"), error);
+		if (opened)
+			CloseHandle(handle);
+		pdu->u.read_resp.status = DokanNtStatusFromWin32(error);
+        pdu->length = sizeof(*pdu);
+	}
+
+    BOOL bret = ReadFile(
+        handle,
+        &pdu->u.read_resp.buffer,
+        req->read_length,
+        &pdu->u.read_resp.actual_length,
+        NULL
+    );
+    if (!bret) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tread failed, error(%d)\n"), error);
+		if (opened)
+			CloseHandle(handle);
+		pdu->u.read_resp.status = DokanNtStatusFromWin32(error);
+        pdu->length = sizeof(*pdu);
+        goto Cleanup;
+	}
+	
+    pr_info(_T("read succeeded, actual(%d)"), pdu->u.read_resp.actual_length);
+
+	if (opened)
+		CloseHandle(handle);
+
+Cleanup:
+    if (pdu) {
+		ret = conn->transport->send(conn, pdu, pdu->length);
+		if (ret < 0) {
+            pr_err(_T("send read-resp failed\n"));
+		}
+
+        free_mirror_pdu(&pdu);
+    }
+}
+
+void mirror_process_write(
+    struct transport_connection* conn, 
+    struct mirror_write_request* req
+)
+{
+	struct mirror_pdu write_resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	BOOL opened = FALSE;
+	int ret;
+	DWORD writeLength = req->length;
+
+	bzero(&write_resp, sizeof(write_resp));
+	
+	write_resp.length = sizeof(write_resp);
+	write_resp.type = MIRROR_PDU_STANDARD_RESPONSE;
+	write_resp.major_function = IRP_MJ_WRITE;
+	write_resp.minor_function = 0;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_info(_T("WriteFile(%s), offset(%I64d), length(%d)\n"), 
+		filePath, req->offset.QuadPart, req->length);
+
+	handle = (HANDLE)req->file_info.Context;
+
+	// reopen the file
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle, cleanuped?\n"));
+		handle = CreateFile(filePath, GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
+			OPEN_EXISTING, 0, NULL);
+		if (handle == INVALID_HANDLE_VALUE) {
+			DWORD error = GetLastError();
+			pr_err(_T("\tCreateFile error : %d\n"), error);
+			write_resp.u.write_resp.status = DokanNtStatusFromWin32(error);
+			goto Cleanup;
+		}
+		opened = TRUE;
+	}
+
+	UINT64 fileSize = 0;
+	DWORD fileSizeLow = 0;
+	DWORD fileSizeHigh = 0;
+	fileSizeLow = GetFileSize(handle, &fileSizeHigh);
+	if (fileSizeLow == INVALID_FILE_SIZE) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tcan not get a file size error = %d\n"), error);
+		if (opened)
+			CloseHandle(handle);
+		write_resp.u.write_resp.status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	fileSize = ((UINT64)fileSizeHigh << 32) | fileSizeLow;
+
+	LARGE_INTEGER distanceToMove;
+	if (req->file_info.WriteToEndOfFile) {
+		LARGE_INTEGER z;
+		z.QuadPart = 0;
+		if (!SetFilePointerEx(handle, z, NULL, FILE_END)) {
+			DWORD error = GetLastError();
+			pr_err(_T("\tseek error, offset = EOF, error = %d\n"), error);
+			if (opened)
+				CloseHandle(handle);
+			write_resp.u.write_resp.status = DokanNtStatusFromWin32(error);
+			goto Cleanup;
+		}
+	}
+	else {
+		// Paging IO cannot write after allocate file size.
+		if (req->file_info.PagingIo) {
+			if (req->offset.QuadPart >= fileSize) {
+				write_resp.u.write_resp.status= STATUS_SUCCESS;
+				write_resp.u.write_resp.actual_length = 0;
+				
+				if (opened)
+					CloseHandle(handle);
+				goto Cleanup;
+			}
+
+			if ((req->offset.QuadPart + req->length) > fileSize) {
+				UINT64 bytes = fileSize - req->offset.QuadPart;
+				if (bytes >> 32) {
+					writeLength = (DWORD)(bytes & 0xFFFFFFFFUL);
+				}
+				else {
+					writeLength = (DWORD)bytes;
+				}
+			}
+		}
+
+		if (req->offset.QuadPart > fileSize) {
+			// In the mirror sample helperZeroFileData is not necessary. NTFS will
+			// zero a hole.
+			// But if user's file system is different from NTFS( or other Windows's
+			// file systems ) then  users will have to zero the hole themselves.
+		}
+
+		distanceToMove.QuadPart = req->offset.QuadPart;
+		if (!SetFilePointerEx(handle, distanceToMove, NULL, FILE_BEGIN)) {
+			DWORD error = GetLastError();
+			pr_err(_T("\tseek error, offset(%I64d), error(%d)\n"), 
+				req->offset.QuadPart, error);
+			if (opened)
+				CloseHandle(handle);
+			write_resp.u.write_resp.status = DokanNtStatusFromWin32(error);
+			goto Cleanup;
+		}
+	}
+
+	BOOL bret = WriteFile(
+		handle,
+		&req->buffer[0],
+		writeLength,
+		&write_resp.u.write_resp.actual_length,
+		NULL
+	);
+	if (!bret) {
+		DWORD error = GetLastError();
+		pr_err(_T("\twrite failed, error(%u), length(%d), actual(%d)\n"),
+			error, writeLength, write_resp.u.write_resp.actual_length);
+		if (opened)
+			CloseHandle(handle);
+		write_resp.u.write_resp.status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+
+	}
+	
+	pr_info(_T("\twrite succeeded, length(%d), offset(%I64d)\n"), 
+		write_resp.u.write_resp.actual_length, req->offset.QuadPart);
+	
+	write_resp.u.write_resp.status = STATUS_SUCCESS;
+
+	// close the file when it is reopened
+	if (opened)
+		CloseHandle(handle);
+
+Cleanup:
+	ret = conn->transport->send(conn, &write_resp, write_resp.length);
+	if (ret < 0) {
+		pr_err(_T("send write-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+void mirror_process_flush_buffers(
+	struct transport_connection* conn,
+	struct mirror_flush_buffers_request* req
+)
+{
+	struct mirror_pdu resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	int ret;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_STANDARD_RESPONSE;
+	resp.major_function = IRP_MJ_FLUSH_BUFFERS;
+	resp.minor_function = 0;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("-> mirror_process_flush_buffers(), file(%s)\n"),
+		filePath);
+	
+	handle = (HANDLE)req->file_info.Context;
+
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_SUCCESS;
+		goto Cleanup;
+	}
+
+	if (!FlushFileBuffers(handle)) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tflush failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+	goto Cleanup;
+
+Cleanup:
+	resp.u.flushbuffers_resp.status = status;
+
+	ret = conn->transport->send(conn, &resp, sizeof(resp));
+	if (ret < 0) {
+		pr_err(_T("send flushbuffers-resp failed, ret(%d)\n"), ret);
+	}
+}
 
 static void MirrorServerCleanup(
 	LPCWSTR FileName,
@@ -735,6 +1015,18 @@ void mirror_server_process_standard_reqeust(
 		mirror_process_query_information(conn, &pdu->u.queryinfo_req);
 		break;
 
+    case IRP_MJ_READ:
+        mirror_process_read(conn, &pdu->u.read_req);
+        break;
+
+    case IRP_MJ_WRITE:
+        mirror_process_write(conn, &pdu->u.write_req);
+        break;
+
+	case IRP_MJ_FLUSH_BUFFERS:
+		mirror_process_flush_buffers(conn, &pdu->u.flushbuffers_req);
+		break;
+
 	default:
 		break;
 	}
@@ -832,6 +1124,989 @@ Cleanup:
     }
 }
 
+void mirror_server_set_file_attributes(
+	struct transport_connection* conn, 
+	struct mirror_file_attributes_request* req
+)
+{
+	struct mirror_pdu resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	int ret;
+
+	bzero(&resp, sizeof(resp));
+	
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_SET_FILE_ATTRIBUTES_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("-> mirror_server_set_file_attributes(), file(%s) attributes(0x%08x)\n"), 
+		filePath, req->file_attributes);
+
+	if (req->file_attributes != 0) {
+		if (!SetFileAttributes(filePath, req->file_attributes)) {
+			DWORD error = GetLastError();
+			pr_err(_T("\terror code = %d\n"), error);
+			resp.u.fileattributes_resp.status = DokanNtStatusFromWin32(error);
+		}
+		else {
+			resp.u.fileattributes_resp.status = STATUS_SUCCESS;
+		}
+	}
+	else {
+		// case FileAttributes == 0 :
+		// MS-FSCC 2.6 File Attributes : There is no file attribute with the value 0x00000000
+		// because a value of 0x00000000 in the FileAttributes field means that the file attributes for this file MUST NOT be changed when setting basic information for the file
+		pr_info(_T("Set 0 to FileAttributes means MUST NOT be changed. Didn't call ")
+			L"SetFileAttributes function. \n");
+		resp.u.fileattributes_resp.status = STATUS_SUCCESS;
+	}
+
+	ret = conn->transport->send(conn, &resp, sizeof(resp));
+	if (ret < 0) {
+		pr_err(_T("send fileattributes-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+void mirror_server_set_file_time(
+	struct transport_connection* conn, 
+	struct mirror_file_time_request* req
+)
+{
+	struct mirror_pdu resp;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	int ret;
+	const FILETIME* createtime = NULL;
+	const FILETIME* lastAccessTime = NULL;
+	const FILETIME* lastWriteTime = NULL;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(L"-> mirror_server_set_file_time(), file(%s)\n", filePath);
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_SET_FILE_TIME_RESPONSE;
+
+	handle = (HANDLE)req->file_info.Context;
+
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	if (req->fSetCreationTime) {
+		createtime = &req->CreationTime;
+	}
+	if (req->fSetLastAccessTime) {
+		lastAccessTime = &req->LastAccessTime;
+	}
+	if (req->fSetLastWriteTime) {
+		lastWriteTime = &req->LastWriteTime;
+	}
+
+	if (!SetFileTime(handle, createtime, lastAccessTime, lastWriteTime)) {
+		DWORD error = GetLastError();
+		pr_err(_T("  set filetime failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.filetime_resp.status = status;
+	ret = conn->transport->send(conn, &resp, sizeof(resp));
+	if (ret < 0) {
+		pr_err(_T("send filetime-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_set_end_of_file(
+	struct transport_connection* conn,
+	struct mirror_set_end_of_file_request* req
+	)
+{
+	struct mirror_pdu resp;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	int ret;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_SET_END_OF_FILE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("-> mirror_server_set_end_of_file(), file(%s), offset(%I64d)\n"),
+		filePath, req->offset.QuadPart);
+
+	handle = (HANDLE)req->file_info.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	if (!SetFilePointerEx(handle, req->offset, NULL, FILE_BEGIN)) {
+		DWORD error = GetLastError();
+		pr_err(_T("  SetFilePointer failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	if (!SetEndOfFile(handle)) {
+		DWORD error = GetLastError();
+		pr_err(_T("SetEndOfFile failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.endoffile_resp.status = status;
+	ret = conn->transport->send(conn, &resp, sizeof(resp));
+	if (ret < 0) {
+		pr_err(_T("send endoffile-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_delete_file(
+	struct transport_connection* conn,
+	struct mirror_delete_file_request* req
+)
+{
+	struct mirror_pdu resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	DWORD dwAttributes;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	int ret;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_DELETE_FILE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("-> mirror_server_delete_file(), file(%s)\n"), filePath);
+
+	handle = (HANDLE)req->file_info.Context;
+	
+	dwAttributes = GetFileAttributes(filePath);
+
+	if (dwAttributes != INVALID_FILE_ATTRIBUTES &&
+		(dwAttributes & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		status = STATUS_ACCESS_DENIED;
+		goto Cleanup;
+	}
+
+	if (handle && handle != INVALID_HANDLE_VALUE) {
+		FILE_DISPOSITION_INFO fdi;
+		BOOL bret;
+		
+		fdi.DeleteFile = req->file_info.DeleteOnClose;
+		
+		bret = SetFileInformationByHandle(
+			handle,
+			FileDispositionInfo,
+			&fdi,
+			sizeof(FILE_DISPOSITION_INFO)
+		);
+		if (!bret) {
+			DWORD dwErrCode = GetLastError();
+			pr_err(_T("set DeleteOnClose failed, error(%d)\n"), dwErrCode);
+			status = DokanNtStatusFromWin32(GetLastError());
+			goto Cleanup;
+		}
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+
+	resp.u.deletefile_resp.status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send deletefile-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_delete_directory(
+	struct transport_connection* conn,
+	struct mirror_delete_directory_request* req
+)
+{
+	struct mirror_pdu resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	HANDLE hFind;
+	WIN32_FIND_DATAW findData;
+	size_t fileLen;
+	int ret;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_DELETE_DIRECTORY_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->file_name);
+
+	pr_debug(_T("-> mirror_server_delete_directory(), file(%s)\n"), filePath);
+
+	if (!req->file_info.DeleteOnClose) {
+		//Dokan notify that the file is requested not to be deleted.
+		status = STATUS_SUCCESS;
+		goto Cleanup;
+	}
+
+	fileLen = wcslen(filePath);
+	if (filePath[fileLen - 1] != L'\\') {
+		filePath[fileLen++] = L'\\';
+	}
+	if (fileLen + 1 >= DOKAN_MAX_PATH) {
+		status = STATUS_BUFFER_OVERFLOW;
+		goto Cleanup;
+	}
+
+	filePath[fileLen] = L'*';
+	filePath[fileLen + 1] = L'\0';
+
+	hFind = FindFirstFile(filePath, &findData);
+
+	if (hFind == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tDeleteDirectory error code = %d\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	do {
+		if (wcscmp(findData.cFileName, L"..") != 0 &&
+			wcscmp(findData.cFileName, L".") != 0) 
+		{
+			FindClose(hFind);
+			pr_err(_T("\tDirectory is not empty: %s\n"), findData.cFileName);
+			status = STATUS_DIRECTORY_NOT_EMPTY;
+			goto Cleanup;
+		}
+	} while (FindNextFile(hFind, &findData) != 0);
+
+	DWORD error = GetLastError();
+
+	FindClose(hFind);
+
+	if (error != ERROR_NO_MORE_FILES) {
+		pr_err(_T("\tDeleteDirectory error code = %d\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+
+	resp.u.deletedirectory_resp.status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send deletedirectory-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+void mirror_server_move_file(
+	struct transport_connection* conn,
+	struct mirror_move_file_request* req
+)
+{
+	struct mirror_pdu resp;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	WCHAR newFilePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	DWORD bufferSize;
+	BOOL bret;
+	size_t newFilePathLen;
+	int ret;
+	PFILE_RENAME_INFO renameInfo = NULL;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_MOVE_FILE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->ExistingFileName);
+	if (wcslen(req->NewFileName) && req->NewFileName[0] != ':') {
+		GetFilePath(newFilePath, DOKAN_MAX_PATH, req->NewFileName);
+	}
+	else {
+		// For a stream rename, FileRenameInfo expect the FileName param without the filename
+		// like :<stream name>:<stream type>
+		wcsncpy_s(newFilePath, DOKAN_MAX_PATH, req->NewFileName, wcslen(req->NewFileName));
+	}
+
+	pr_debug(_T("-> mirror_server_move_file(), %s -> %s\n"), filePath, newFilePath);
+
+	handle = (HANDLE)req->FileInfo.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	newFilePathLen = wcslen(newFilePath);
+
+	// the PFILE_RENAME_INFO struct has space for one WCHAR for the name at
+	// the end, so that
+	// accounts for the null terminator
+
+	bufferSize = (DWORD)(sizeof(FILE_RENAME_INFO) +
+		newFilePathLen * sizeof(newFilePath[0]));
+
+	renameInfo = (PFILE_RENAME_INFO)malloc(bufferSize);
+	if (!renameInfo) {
+		pr_err(_T("allocate FILE_RENAME_INFO failed\n"));
+		status = STATUS_BUFFER_OVERFLOW;
+		goto Cleanup;
+	}
+	ZeroMemory(renameInfo, bufferSize);
+
+	renameInfo->ReplaceIfExists =
+		req->ReplaceIfExisting
+		? TRUE
+		: FALSE; 
+	renameInfo->RootDirectory = NULL; // hope it is never needed, shouldn't be
+	renameInfo->FileNameLength =
+		(DWORD)newFilePathLen *
+		sizeof(newFilePath[0]); // they want length in bytes
+
+	wcscpy_s(renameInfo->FileName, newFilePathLen + 1, newFilePath);
+
+	bret = SetFileInformationByHandle(
+		handle, FileRenameInfo, renameInfo, bufferSize
+	);
+
+	free(renameInfo);
+
+	if (!bret) {
+		DWORD error = GetLastError();
+		pr_err(_T("\tMoveFile failed, error(%u)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.movefile_resp.status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send movefile-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+void mirror_server_set_allocation_size(
+	struct transport_connection* conn,
+	struct mirror_set_allocation_size_request* req
+)
+{
+	struct mirror_pdu resp;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	int ret;
+
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	LARGE_INTEGER fileSize;
+	
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_SET_ALLOCATION_SIZE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_debug(_T("SetAllocationSize %s, %I64d\n"), filePath, req->AllocSize);
+
+	handle = (HANDLE)req->FileInfo.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	if (GetFileSizeEx(handle, &fileSize)) {
+		if (req->AllocSize < fileSize.QuadPart) {
+			fileSize.QuadPart = req->AllocSize;
+			if (!SetFilePointerEx(handle, fileSize, NULL, FILE_BEGIN)) {
+				DWORD error = GetLastError();
+				pr_err(_T("SetFilePointer failed, error(%d), offset(%I64d)\n"),
+					error, req->AllocSize);
+				status = DokanNtStatusFromWin32(error);
+				goto Cleanup;
+			}
+
+			if (!SetEndOfFile(handle)) {
+				DWORD error = GetLastError();
+				pr_err(_T("\tSetEndOfFile failed, error(%d)\n"), error);
+				status = DokanNtStatusFromWin32(error);
+				goto Cleanup;
+			}
+		}
+	}
+	else {
+		DWORD error = GetLastError();
+		pr_err(_T("\terror code = %d\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+	
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.allocsize_resp.Status = status;
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send allocsize-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_lock_file(
+	struct transport_connection* conn,
+	struct mirror_lock_file_request* req
+)
+{
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	LARGE_INTEGER offset;
+	LARGE_INTEGER length;
+	BOOL bret;
+	struct mirror_pdu resp;
+	int ret;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_UNLOCK_FILE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_err(_T("LockFile %s\n"), filePath);
+
+	handle = (HANDLE)req->FileInfo.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	length.QuadPart = req->Length;
+	offset.QuadPart = req->ByteOffset;
+
+	bret = LockFile(
+		handle,
+		offset.LowPart,
+		offset.HighPart,
+		length.LowPart,
+		length.HighPart
+	);
+	if (!bret) {
+		DWORD error = GetLastError();
+		pr_err(_T("LockFile failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.lockfile_resp.Status = status;
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send lockfile-req failed, ret(%d)\n"), ret);
+	}
+}
+
+void mirror_server_unlock_file(
+	struct transport_connection* conn,
+	struct mirror_unlock_file_request* req
+)
+{
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	LARGE_INTEGER length;
+	LARGE_INTEGER offset;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	struct mirror_pdu resp;
+	int ret;
+	BOOL bret;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_UNLOCK_FILE_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_debug(_T("UnlockFile %s\n"), filePath);
+
+	handle = (HANDLE)req->FileInfo.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	length.QuadPart = req->Length;
+	offset.QuadPart = req->ByteOffset;
+
+	bret = UnlockFile(
+		handle,
+		offset.LowPart,
+		offset.HighPart,
+		length.LowPart,
+		length.HighPart
+	);
+	if (!bret) {
+		DWORD error = GetLastError();
+		pr_err(_T("UnlockFile failed, error(%d)\n\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	resp.u.unlockfile_resp.Status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send unlockfile-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_get_file_security(
+	struct transport_connection* conn,
+	struct mirror_get_file_security_request* req
+)
+{
+	WCHAR filePath[DOKAN_MAX_PATH];
+	BOOLEAN requestingSaclInfo;
+	struct mirror_pdu* resp = NULL;
+	struct mirror_pdu pdu_buffer;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	int ret;
+	HANDLE handle = INVALID_HANDLE_VALUE;
+	SECURITY_INFORMATION* SecurityInformation = &req->SecurityInfomration;
+	SECURITY_DESCRIPTOR* SecurityDescriptor = (SECURITY_DESCRIPTOR *)&req->SecurityDescriptor[0];
+	ULONG* LengthNeeded = &req->LengthNeeded;
+	BOOL fHasSeSecurityPrivilege = FALSE;
+	BOOL bret;
+
+	bzero(&pdu_buffer, sizeof(pdu_buffer));
+	
+	pdu_buffer.length = sizeof(pdu_buffer);
+	pdu_buffer.type = MIRROR_PDU_GET_FILE_SECURITY_RESPONSE;
+
+	resp = alloc_mirror_pdu(sizeof(*resp) + req->BufferLength);
+	if (!resp) {
+		pr_err(_T("allocate getfilesecurity-resp failed\n"));
+		resp = &pdu_buffer;
+		status = STATUS_NO_MEMORY;
+		goto Cleanup;
+	}
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_info(_T("GetFileSecurity %s\n"), filePath);
+
+	MirrorCheckFlag(*SecurityInformation, FILE_SHARE_READ);
+	MirrorCheckFlag(*SecurityInformation, OWNER_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, GROUP_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, DACL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, SACL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, LABEL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, ATTRIBUTE_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, SCOPE_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation,
+		PROCESS_TRUST_LABEL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, BACKUP_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, PROTECTED_DACL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, PROTECTED_SACL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, UNPROTECTED_DACL_SECURITY_INFORMATION);
+	MirrorCheckFlag(*SecurityInformation, UNPROTECTED_SACL_SECURITY_INFORMATION);
+
+	requestingSaclInfo = ((*SecurityInformation & SACL_SECURITY_INFORMATION) ||
+		(*SecurityInformation & BACKUP_SECURITY_INFORMATION));
+
+	if (fHasSeSecurityPrivilege) {
+		*SecurityInformation &= ~SACL_SECURITY_INFORMATION;
+		*SecurityInformation &= ~BACKUP_SECURITY_INFORMATION;
+	}
+
+	pr_info(_T("  Opening new handle with READ_CONTROL access\n"));
+	handle = CreateFile(
+		filePath,
+		READ_CONTROL | ((requestingSaclInfo && fHasSeSecurityPrivilege)
+			? ACCESS_SYSTEM_SECURITY
+			: 0),
+		FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+		NULL, // security attribute
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS, // |FILE_FLAG_NO_BUFFERING,
+		NULL);
+
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		int error = GetLastError();
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	bret = GetUserObjectSecurity(
+		handle, 
+		SecurityInformation, 
+		SecurityDescriptor,
+		req->BufferLength, 
+		LengthNeeded
+	);
+	
+	if (!bret) {
+		int error = GetLastError();
+		if (error == ERROR_INSUFFICIENT_BUFFER) {
+			pr_err(_T("  GetUserObjectSecurity error: ERROR_INSUFFICIENT_BUFFER\n"));
+			status = STATUS_BUFFER_OVERFLOW;
+			goto Cleanup;
+		}
+		else {
+			pr_err(_T("  GetUserObjectSecurity failed, error(%d)\n"), error);
+			status = DokanNtStatusFromWin32(error);
+			goto Cleanup;
+		}
+	}
+
+	// Ensure the Security Descriptor Length is set
+	DWORD securityDescriptorLength =
+		GetSecurityDescriptorLength(SecurityDescriptor);
+	pr_info(_T("  GetUserObjectSecurity return true,  *LengthNeeded = %d\n"),
+		securityDescriptorLength);
+
+	*LengthNeeded = securityDescriptorLength;
+	
+	resp->u.getfilesecurity_resp.SecurityInformation = *SecurityInformation;
+	resp->u.getfilesecurity_resp.BufferLength = req->BufferLength;
+	resp->u.getfilesecurity_resp.LengthNeeded = *LengthNeeded;
+	memcpy(
+		resp->u.getfilesecurity_resp.SecurityDescriptor,
+		SecurityDescriptor,
+		req->BufferLength
+	);
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	if (!handle && handle != INVALID_HANDLE_VALUE) {
+		CloseHandle(handle);
+	}
+
+	ret = conn->transport->send(conn, resp, resp->length);
+	if (ret < 0) {
+		pr_err(_T("send getfilesecurity-resp failed, ret(%d)\n"), ret);
+	}
+
+	if (resp != &pdu_buffer) {
+		free_mirror_pdu(&resp);
+	}
+}
+
+void mirror_server_set_file_security(
+	struct transport_connection* conn,
+	struct mirror_set_file_security_request* req
+)
+{
+	struct mirror_pdu* resp = NULL;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE handle;
+	NTSTATUS status;
+	BOOL bret;
+	int ret;
+
+	resp = alloc_mirror_pdu(sizeof(*resp) + req->SecurityDescriptorLength);
+	if (!resp) {
+		pr_err(_T("alloc setfilesecurity-resp failed\n"));
+		goto Cleanup;
+	}
+
+	resp->type = MIRROR_PDU_SET_FILE_SECURITY_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_debug(_T("SetFileSecurity %s\n"), filePath);
+
+	handle = (HANDLE)req->FileInfo.Context;
+	if (!handle || handle == INVALID_HANDLE_VALUE) {
+		pr_err(_T("\tinvalid handle\n"));
+		status = STATUS_INVALID_HANDLE;
+		goto Cleanup;
+	}
+
+	bret = SetUserObjectSecurity(
+		handle, 
+		&req->SecurityInformation, 
+		(PSECURITY_DESCRIPTOR)&req->SecurityDescriptor[0]
+	);
+	if (!bret) {
+		int error = GetLastError();
+		pr_err(_T("  SetUserObjectSecurity error: %d\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+	
+	resp->u.setfilesecurity_resp.SecurityInformation =
+		req->SecurityInformation;
+	resp->u.setfilesecurity_resp.SecurityDescriptorLength =
+		req->SecurityDescriptorLength;
+	memcpy(
+		&resp->u.setfilesecurity_resp.SecurityDescriptor[0],
+		&req->SecurityDescriptor[0],
+		req->SecurityDescriptorLength
+	);
+
+	status = STATUS_SUCCESS;
+
+Cleanup:
+	if (resp) {
+		ret = conn->transport->send(conn, resp, resp->length);
+		if (ret < 0) {
+			pr_err(_T("send setfilesecurity-resp failed, ret(%d)\n"), ret);
+		}
+	}
+
+	if (resp) {
+		free_mirror_pdu(&resp);
+	}
+}
+
+
+void mirror_server_get_disk_free_space(
+	struct transport_connection* conn,
+	struct mirror_get_disk_free_space_request* req
+)
+{
+	struct mirror_pdu resp;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	int ret;
+	DWORD SectorsPerCluster;
+	DWORD BytesPerSector;
+	DWORD NumberOfFreeClusters;
+	DWORD TotalNumberOfClusters;
+	WCHAR DriveLetter[3] = { 'C', ':', 0 };
+	PWCHAR RootPathName;
+
+	bzero(&resp, sizeof(resp));
+
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_GET_DISK_FREE_SPACE_RESPONSE;
+
+	if (RootDirectory[0] == L'\\') { // UNC as Root
+		RootPathName = RootDirectory;
+	}
+	else {
+		DriveLetter[0] = RootDirectory[0];
+		RootPathName = DriveLetter;
+	}
+
+	GetDiskFreeSpace(
+		RootPathName, 
+		&SectorsPerCluster, 
+		&BytesPerSector,
+		&NumberOfFreeClusters, 
+		&TotalNumberOfClusters
+	);
+	resp.u.getdiskfreespace_resp.FreeBytesAvailable =
+		((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+	resp.u.getdiskfreespace_resp.TotalNumberOfFreeBytes =
+		((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+	resp.u.getdiskfreespace_resp.TotalNumberOfBytes =
+		((ULONGLONG)SectorsPerCluster) * BytesPerSector * TotalNumberOfClusters;
+
+	status = STATUS_SUCCESS;
+
+	resp.u.getdiskfreespace_resp.Status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send getdiskfreespace-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_get_volume_info(
+	struct transport_connection* conn,
+	struct mirror_get_volume_info_request* req
+)
+{
+	BOOL CaseSensitive = FALSE;
+	struct mirror_pdu pdu;
+	struct mirror_get_volume_info_response* resp;
+	WCHAR volumeRoot[4];
+	DWORD fsFlags = 0;
+	BOOL bret;
+	int ret;
+
+	bzero(&pdu, sizeof(pdu));
+
+	pdu.length = sizeof(pdu);
+	pdu.type = MIRROR_PDU_GET_VOLUME_INFO_RESPONSE;
+
+	resp = &pdu.u.getvolumeinfo_resp;
+
+	wcscpy_s(resp->VolumeName, ARRAYSIZE(resp->VolumeName), L"DOKAN");
+
+	resp->VolumeSerialNumber = 0x19831116;
+	resp->MaximumComponentLength = 255;
+	resp->FileSystemFlags = 
+		FILE_SUPPORTS_REMOTE_STORAGE | 
+		FILE_UNICODE_ON_DISK |
+		FILE_PERSISTENT_ACLS | 
+		FILE_NAMED_STREAMS;
+
+	if (CaseSensitive) {
+		resp->FileSystemFlags |=
+			FILE_CASE_SENSITIVE_SEARCH |
+			FILE_CASE_PRESERVED_NAMES;
+	}
+
+	volumeRoot[0] = RootDirectory[0];
+	volumeRoot[1] = ':';
+	volumeRoot[2] = '\\';
+	volumeRoot[3] = '\0';
+	
+	bret = GetVolumeInformation(
+		volumeRoot, 
+		NULL, 
+		0, 
+		NULL, 
+		&resp->MaximumComponentLength,
+		&fsFlags, 
+		resp->FileSystemName,
+		ARRAYSIZE(resp->FileSystemName)
+	);
+	
+	if (bret) {
+		resp->FileSystemFlags &= fsFlags;
+
+		pr_info(_T("  MaximumComponentLength: %u\n"),
+			resp->MaximumComponentLength);
+		
+		pr_info(_T("FileSystemName: %s\n"),
+				resp->FileSystemName);
+		
+		pr_info(_T("FileSystemFlags(0x%08x), fsFlags(0x%08x)\n"),
+			resp->FileSystemFlags, fsFlags);
+	}
+	else {
+
+		pr_err(_T("GetVolumeInformation failed, error(%d)\n"), GetLastError());
+
+		// File system name could be anything up to 10 characters.
+		// But Windows check few feature availability based on file system name.
+		// For this, it is recommended to set NTFS or FAT here.
+		wcscpy_s(resp->FileSystemName, ARRAYSIZE(resp->FileSystemName), L"NTFS");
+	}
+
+	ret = conn->transport->send(conn, &pdu, pdu.length);
+	if (ret < 0) {
+		pr_err(_T("send getvolumeinfo-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
+void mirror_server_find_streams(
+	struct transport_connection* conn,
+	struct mirror_pdu_find_streams_request* req
+)
+{
+	struct mirror_pdu resp;
+	WCHAR filePath[DOKAN_MAX_PATH];
+	HANDLE hFind = INVALID_HANDLE_VALUE;
+	int ret;
+	DWORD error;
+	int count = 0;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+	bzero(&resp, sizeof(resp));
+	
+	resp.length = sizeof(resp);
+	resp.type = MIRROR_PDU_FIND_STREAMS_RESPONSE;
+
+	GetFilePath(filePath, DOKAN_MAX_PATH, req->FileName);
+
+	pr_debug(_T("FindStreams :%s\n"), filePath);
+
+	hFind = FindFirstStreamW(
+		filePath, 
+		FindStreamInfoStandard, 
+		&resp.u.findstreams_resp.FindStreamData, 
+		0
+	);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		error = GetLastError();
+		pr_err(_T("FindFirstStreamW() failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	resp.u.findstreams_resp.Status = STATUS_SUCCESS;
+
+	do {
+		ret = conn->transport->send(conn, &resp, resp.length);
+		if (ret < 0) {
+			pr_err(_T("send findstreams-resp failed, ret(%d)\n"), ret);
+			break;
+		}
+
+		count++;
+
+	} while (FindNextStreamW(hFind, &resp.u.findstreams_resp.FindStreamData) != 0);
+
+	error = GetLastError();
+	FindClose(hFind);
+
+	if (error != ERROR_HANDLE_EOF) {
+		pr_err(_T("FindNextStreamW failed, error(%d)\n"), error);
+		status = DokanNtStatusFromWin32(error);
+		goto Cleanup;
+	}
+
+	status = STATUS_NO_MORE_ENTRIES;
+
+Cleanup:
+	resp.u.findstreams_resp.Status = status;
+
+	ret = conn->transport->send(conn, &resp, resp.length);
+	if (ret < 0) {
+		pr_err(_T("send findstreams-resp failed, ret(%d)\n"), ret);
+	}
+}
+
+
 void mirror_process_request(
 	struct transport_connection* conn,
 	struct mirror_pdu* pdu
@@ -845,6 +2120,62 @@ void mirror_process_request(
     case MIRROR_PDU_FIND_FILES_REQUEST:
         mirror_server_find_files(conn, pdu);
         break;
+
+	case MIRROR_PDU_SET_FILE_ATTRIBUTES_REQUEST:
+		mirror_server_set_file_attributes(conn, &pdu->u.fileattributes_req);
+		break;
+
+	case MIRROR_PDU_SET_FILE_TIME_REQUEST:
+		mirror_server_set_file_time(conn, &pdu->u.filetime_req);
+		break;
+
+	case MIRROR_PDU_SET_END_OF_FILE_REQUEST:
+		mirror_server_set_end_of_file(conn, &pdu->u.endoffile_req);
+		break;
+
+	case MIRROR_PDU_DELETE_FILE_REQUEST:
+		mirror_server_delete_file(conn, &pdu->u.deletefile_req);
+		break;
+
+	case MIRROR_PDU_DELETE_DIRECTORY_RESPONSE:
+		mirror_server_delete_directory(conn, &pdu->u.deletedirectory_req);
+		break;
+
+	case MIRROR_PDU_MOVE_FILE_REQUEST:
+		mirror_server_move_file(conn, &pdu->u.movefile_req);
+		break;
+
+	case MIRROR_PDU_SET_ALLOCATION_SIZE_REQUEST:
+		mirror_server_set_allocation_size(conn, &pdu->u.allocsize_req);
+		break;
+
+	case MIRROR_PDU_LOCK_FILE_REQUEST:
+		mirror_server_lock_file(conn, &pdu->u.lockfile_req);
+		break;
+
+	case MIRROR_PDU_UNLOCK_FILE_REQUEST:
+		mirror_server_unlock_file(conn, &pdu->u.unlockfile_req);
+		break;
+
+	case MIRROR_PDU_GET_FILE_SECURITY_REQUEST:
+		mirror_server_get_file_security(conn, &pdu->u.getfilesecurity_req);
+		break;
+
+	case MIRROR_PDU_SET_FILE_SECURITY_REQUEST:
+		mirror_server_set_file_security(conn, &pdu->u.setfilesecurity_req);
+		break;
+
+	case MIRROR_PDU_GET_DISK_FREE_SPACE_REQUEST:
+		mirror_server_get_disk_free_space(conn, &pdu->u.getdiskfreespace_req);
+		break;
+
+	case MIRROR_PDU_GET_VOLUME_INFO_REQUEST:
+		mirror_server_get_volume_info(conn, &pdu->u.getvolumeinfo_req);
+		break;
+
+	case MIRROR_PDU_FIND_STREAMS_REQUEST:
+		mirror_server_find_streams(conn, &pdu->u.findstreams_req);
+		break;
 
     default:
         pr_err(_T("unknown pdu->type(%d)\n"), pdu->type);
